@@ -1,0 +1,317 @@
+
+from __future__ import annotations
+
+import hmac
+import hashlib
+import secrets
+import time
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+audit = logging.getLogger("EVSE-Security")
+
+
+class AuthenticationError(Exception):
+    pass
+
+
+class ReplayAttackDetected(Exception):
+    pass
+
+
+class IntrusionLockout(Exception):
+    pass
+
+
+class CredentialStore:
+    def __init__(self):
+        self._secrets: dict[str, bytes] = {}
+
+    def register_vehicle(self, vehicle_id: str, shared_secret: bytes) -> None:
+        self._secrets[vehicle_id] = shared_secret
+        audit.info(f"Provisioned credentials for vehicle '{vehicle_id}'")
+
+    def get_secret(self, vehicle_id: str) -> Optional[bytes]:
+        return self._secrets.get(vehicle_id)
+
+
+class IntrusionDetectionSystem:
+    def __init__(
+        self,
+        max_failed_auth: int = 3,
+        lockout_seconds: int = 30,
+        replay_window_seconds: int = 20,
+        max_power_jump_kw: float = 15.0,
+    ):
+        self.max_failed_auth = max_failed_auth
+        self.lockout_seconds = lockout_seconds
+        self.replay_window_seconds = replay_window_seconds
+        self.max_power_jump_kw = max_power_jump_kw
+
+        self._failed_attempts: dict[str, int] = {}
+        self._lockout_until: dict[str, float] = {}
+        self._seen_nonces: dict[str, dict[bytes, float]] = {}
+        self._last_meter_kw: dict[str, float] = {}
+
+    def check_lockout(self, vehicle_id: str) -> None:
+        until = self._lockout_until.get(vehicle_id)
+        if until and time.time() < until:
+            remaining = round(until - time.time(), 1)
+            audit.warning(f"BLOCKED login attempt from '{vehicle_id}' (locked out, {remaining}s remaining)")
+            raise IntrusionLockout(f"'{vehicle_id}' is locked out for {remaining}s")
+
+    def record_failed_auth(self, vehicle_id: str) -> None:
+        count = self._failed_attempts.get(vehicle_id, 0) + 1
+        self._failed_attempts[vehicle_id] = count
+        audit.warning(f"Failed authentication #{count} from '{vehicle_id}'")
+        if count >= self.max_failed_auth:
+            self._lockout_until[vehicle_id] = time.time() + self.lockout_seconds
+            audit.error(
+                f"INTRUSION ALERT: '{vehicle_id}' exceeded {self.max_failed_auth} failed attempts "
+                f"-> locked out for {self.lockout_seconds}s"
+            )
+
+    def record_success(self, vehicle_id: str) -> None:
+        self._failed_attempts[vehicle_id] = 0
+
+    def check_replay(self, vehicle_id: str, nonce: bytes, timestamp: float) -> None:
+        now = time.time()
+        if abs(now - timestamp) > self.replay_window_seconds:
+            audit.error(f"REPLAY/DESYNC ALERT: stale timestamp from '{vehicle_id}'")
+            raise ReplayAttackDetected("Message timestamp outside acceptable window")
+
+        seen = self._seen_nonces.setdefault(vehicle_id, {})
+        for old_nonce, ts in list(seen.items()):
+            if now - ts > self.replay_window_seconds:
+                del seen[old_nonce]
+
+        if nonce in seen:
+            audit.error(f"REPLAY ATTACK DETECTED: nonce reuse from '{vehicle_id}'")
+            raise ReplayAttackDetected("Nonce already used")
+
+        seen[nonce] = now
+
+    def check_meter_anomaly(self, vehicle_id: str, new_kw: float) -> None:
+        last = self._last_meter_kw.get(vehicle_id)
+        if last is not None and abs(new_kw - last) > self.max_power_jump_kw:
+            audit.error(
+                f"ANOMALY ALERT: implausible power jump for '{vehicle_id}' "
+                f"({last} kW -> {new_kw} kW). Possible meter tampering."
+            )
+        self._last_meter_kw[vehicle_id] = new_kw
+
+
+def derive_session_key(shared_secret: bytes, client_nonce: bytes, server_nonce: bytes) -> bytes:
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=client_nonce + server_nonce,
+        info=b"evse-session-key",
+    ).derive(shared_secret)
+
+
+def encrypt_message(session_key: bytes, plaintext: dict, aad: bytes) -> tuple[bytes, bytes]:
+    aesgcm = AESGCM(session_key)
+    nonce = secrets.token_bytes(12)
+    data = json.dumps(plaintext).encode()
+    ciphertext = aesgcm.encrypt(nonce, data, aad)
+    return nonce, ciphertext
+
+
+def decrypt_message(session_key: bytes, nonce: bytes, ciphertext: bytes, aad: bytes) -> dict:
+    aesgcm = AESGCM(session_key)
+    data = aesgcm.decrypt(nonce, ciphertext, aad)
+    return json.loads(data.decode())
+
+
+@dataclass
+class PendingHandshake:
+    client_nonce: bytes
+    server_nonce: bytes
+    created_at: float = field(default_factory=time.time)
+
+
+@dataclass
+class ActiveSession:
+    session_key: bytes
+    transaction_kwh: float = 0.0
+
+
+class ChargingStation:
+    def __init__(self, station_id: str, credentials: CredentialStore, ids: IntrusionDetectionSystem):
+        self.station_id = station_id
+        self.credentials = credentials
+        self.ids = ids
+        self._pending: dict[str, PendingHandshake] = {}
+        self._sessions: dict[str, ActiveSession] = {}
+
+    def handle_hello(self, vehicle_id: str, client_nonce: bytes) -> bytes:
+        self.ids.check_lockout(vehicle_id)
+        server_nonce = secrets.token_bytes(16)
+        self._pending[vehicle_id] = PendingHandshake(client_nonce, server_nonce)
+        audit.info(f"[{self.station_id}] Challenge issued to '{vehicle_id}'")
+        return server_nonce
+
+    def verify_response(self, vehicle_id: str, hmac_response: bytes) -> None:
+        self.ids.check_lockout(vehicle_id)
+        pending = self._pending.get(vehicle_id)
+        secret = self.credentials.get_secret(vehicle_id)
+
+        if not pending or not secret:
+            self.ids.record_failed_auth(vehicle_id)
+            raise AuthenticationError("Unknown vehicle or expired handshake")
+
+        expected = hmac.new(
+            secret, pending.client_nonce + pending.server_nonce, hashlib.sha256
+        ).digest()
+
+        if not hmac.compare_digest(expected, hmac_response):
+            self.ids.record_failed_auth(vehicle_id)
+            raise AuthenticationError("HMAC verification failed - possible spoofing attempt")
+
+        session_key = derive_session_key(secret, pending.client_nonce, pending.server_nonce)
+        self._sessions[vehicle_id] = ActiveSession(session_key=session_key)
+        self.ids.record_success(vehicle_id)
+        del self._pending[vehicle_id]
+        audit.info(f"[{self.station_id}] '{vehicle_id}' authenticated. Secure session established.")
+
+    def receive_message(self, vehicle_id: str, nonce: bytes, ciphertext: bytes, timestamp: float) -> Optional[dict]:
+        session = self._sessions.get(vehicle_id)
+        if not session:
+            audit.error(f"REJECTED message from '{vehicle_id}': no active secure session")
+            raise AuthenticationError("No active session - message rejected")
+
+        self.ids.check_replay(vehicle_id, nonce, timestamp)
+
+        aad = vehicle_id.encode()
+        try:
+            message = decrypt_message(session.session_key, nonce, ciphertext, aad)
+        except Exception:
+            audit.error(f"INTEGRITY ALERT: decryption/auth-tag failure for '{vehicle_id}' - message tampered or corrupted")
+            raise
+
+        return self._dispatch_ocpp(vehicle_id, session, message)
+
+    def _dispatch_ocpp(self, vehicle_id: str, session: ActiveSession, message: dict) -> dict:
+        msg_type = message.get("type")
+        payload = message.get("payload", {})
+
+        if msg_type == "BootNotification":
+            audit.info(f"[{self.station_id}] BootNotification from '{vehicle_id}': {payload}")
+            return {"status": "Accepted"}
+
+        elif msg_type == "StartTransaction":
+            audit.info(f"[{self.station_id}] StartTransaction for '{vehicle_id}'")
+            session.transaction_kwh = 0.0
+            return {"status": "Accepted", "transactionId": secrets.token_hex(4)}
+
+        elif msg_type == "MeterValues":
+            kw = float(payload.get("kw", 0))
+            self.ids.check_meter_anomaly(vehicle_id, kw)
+            session.transaction_kwh += kw
+            audit.info(f"[{self.station_id}] MeterValues from '{vehicle_id}': {kw} kW (cumulative {session.transaction_kwh:.2f} kWh)")
+            return {"status": "Accepted"}
+
+        elif msg_type == "StopTransaction":
+            audit.info(f"[{self.station_id}] StopTransaction for '{vehicle_id}'. Total: {session.transaction_kwh:.2f} kWh")
+            return {"status": "Accepted", "totalKwh": session.transaction_kwh}
+
+        else:
+            audit.warning(f"Unknown message type '{msg_type}' from '{vehicle_id}'")
+            return {"status": "Rejected"}
+
+
+class ElectricVehicle:
+    def __init__(self, vehicle_id: str, shared_secret: bytes):
+        self.vehicle_id = vehicle_id
+        self.shared_secret = shared_secret
+        self.session_key: Optional[bytes] = None
+
+    def connect(self, station: ChargingStation) -> None:
+        client_nonce = secrets.token_bytes(16)
+        server_nonce = station.handle_hello(self.vehicle_id, client_nonce)
+        response = hmac.new(self.shared_secret, client_nonce + server_nonce, hashlib.sha256).digest()
+        station.verify_response(self.vehicle_id, response)
+        self.session_key = derive_session_key(self.shared_secret, client_nonce, server_nonce)
+
+    def send_message(self, station: ChargingStation, msg_type: str, payload: dict) -> dict:
+        if not self.session_key:
+            raise AuthenticationError("Not connected - call connect() first")
+        aad = self.vehicle_id.encode()
+        nonce, ciphertext = encrypt_message(self.session_key, {"type": msg_type, "payload": payload}, aad)
+        return station.receive_message(self.vehicle_id, nonce, ciphertext, time.time())
+
+
+def run_normal_charging_session(station: ChargingStation, ev: ElectricVehicle) -> None:
+    print("\n--- Legitimate charging session ---")
+    ev.connect(station)
+    ev.send_message(station, "BootNotification", {"model": "Generic-EV", "vendor": "Acme"})
+    ev.send_message(station, "StartTransaction", {})
+    for kw in (7.2, 7.4, 7.1):
+        ev.send_message(station, "MeterValues", {"kw": kw})
+    ev.send_message(station, "StopTransaction", {})
+
+
+def simulate_brute_force_attack(station: ChargingStation, vehicle_id: str) -> None:
+    print("\n--- Simulated attack: brute-force authentication ---")
+    for attempt in range(5):
+        try:
+            client_nonce = secrets.token_bytes(16)
+            server_nonce = station.handle_hello(vehicle_id, client_nonce)
+            fake_response = secrets.token_bytes(32)
+            station.verify_response(vehicle_id, fake_response)
+        except (AuthenticationError, IntrusionLockout) as e:
+            print(f"  attempt {attempt + 1}: blocked ({e})")
+
+
+def simulate_replay_attack(station: ChargingStation, ev: ElectricVehicle) -> None:
+    print("\n--- Simulated attack: replaying a captured message ---")
+    ev.connect(station)
+    aad = ev.vehicle_id.encode()
+    nonce, ciphertext = encrypt_message(ev.session_key, {"type": "MeterValues", "payload": {"kw": 7.0}}, aad)
+    ts = time.time()
+    station.receive_message(ev.vehicle_id, nonce, ciphertext, ts)
+    try:
+        station.receive_message(ev.vehicle_id, nonce, ciphertext, ts)
+    except ReplayAttackDetected as e:
+        print(f"  replay blocked: {e}")
+
+
+def simulate_meter_tampering(station: ChargingStation, ev: ElectricVehicle) -> None:
+    print("\n--- Simulated attack: meter-value tampering (energy theft) ---")
+    ev.connect(station)
+    ev.send_message(station, "StartTransaction", {})
+    ev.send_message(station, "MeterValues", {"kw": 7.0})
+    ev.send_message(station, "MeterValues", {"kw": 48.0})
+
+
+def main() -> None:
+    creds = CredentialStore()
+    ids = IntrusionDetectionSystem()
+    station = ChargingStation("EVSE-001", creds, ids)
+
+    creds.register_vehicle("EV-ALICE", secrets.token_bytes(32))
+    creds.register_vehicle("EV-BOB", secrets.token_bytes(32))
+
+    alice = ElectricVehicle("EV-ALICE", creds.get_secret("EV-ALICE"))
+    bob = ElectricVehicle("EV-BOB", creds.get_secret("EV-BOB"))
+
+    run_normal_charging_session(station, alice)
+    simulate_brute_force_attack(station, "EV-MALLORY")
+    simulate_replay_attack(station, bob)
+    simulate_meter_tampering(station, alice)
+
+
+if __name__ == "__main__":
+    main()
